@@ -1,1 +1,1 @@
-kubectl cp ../POP srip22-ctl/pop-dep-6bd4b9f786-fx5jg:/mnt/code/
+kubectl cp ../CVTR srip22-ctl/cvtr-dep-74df9f9f66-kdgfg:/mnt/code/

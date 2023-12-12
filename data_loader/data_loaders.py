@@ -1,27 +1,26 @@
-from torchvision import datasets, transforms
-from base import BaseDataLoader
-import torch
+import os
+from torch.utils.data import DataLoader, DistributedSampler
 
 
-class ContinualLoader(BaseDataLoader):
-    def __init__(self, dataset, batch_size, shuffle=True, validation_split=0.0, num_workers=1, **kwargs):
+class ContinualLoader(DataLoader):
+    def __init__(self, dataset, batch_size, shuffle=True, num_workers=1, **kwargs):
         self.dataset = dataset
+        self.dataset_type = dataset.dataset_type
         self.batch_size = batch_size
         self.shuffle = shuffle
-        self.validation_split = validation_split
         self.num_workers = num_workers
-        super().__init__(self.dataset, batch_size, shuffle, validation_split, num_workers)
 
+        if self.dataset_type == "train":
+            world_size = int(os.environ['WORLD_SIZE'])
+            rank = int(os.environ['RANK'])
+            sampler = DistributedSampler(dataset=dataset, num_replicas=world_size, rank=rank, shuffle=True, drop_last=False)
+            num_workers = 0
+            self.num_workers = 0
+            super().__init__(self.dataset, batch_size=batch_size, pin_memory=False, num_workers=num_workers,
+                             drop_last=False, sampler=sampler)
+        else:
+            # For validation/test dataset, to avoid the annoying drop_last problem, we do not use distributed sampler
+            sampler = None
+            super().__init__(self.dataset, batch_size=batch_size, pin_memory=False, num_workers=num_workers,
+                             drop_last=False, shuffle=shuffle, sampler=sampler)
 
-class MnistDataLoader(BaseDataLoader):
-    """
-    MNIST data loading demo using BaseDataLoader
-    """
-    def __init__(self, data_dir, batch_size, shuffle=True, validation_split=0.0, num_workers=1, training=True):
-        trsfm = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.1307,), (0.3081,))
-        ])
-        self.data_dir = data_dir
-        self.dataset = datasets.MNIST(self.data_dir, train=training, download=True, transform=trsfm)
-        super().__init__(self.dataset, batch_size, shuffle, validation_split, num_workers)

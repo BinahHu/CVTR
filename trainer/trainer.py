@@ -8,14 +8,15 @@ from torchvision.utils import make_grid
 from numpy import inf
 from utils import inf_loop, MetricTracker, memory_builder
 from logger import TensorboardWriter
-from dataset.ProbingDataset import dataset_folders
 
+os.environ["TOKENIZERS_PARALLELISM"] = "false"
 class ContinualTrainer:
+    global_debug_flag = False
     """
     Trainer class
     """
     def __init__(self, config, criterion, metrics, train_dataset, val_dataset, model, device,
-                 len_epoch=None):
+                 iter_per_epoch=None):
         self.config = config
         self.local_rank = int(os.environ['LOCAL_RANK'])
         self.logger = config.get_logger('trainer', config['trainer']['verbosity'])
@@ -34,11 +35,6 @@ class ContinualTrainer:
         self.lr_scheduler = None
         self.optimizer = None
         self.epochs = None
-
-        # Linear prob parameters
-        self.linear_prob_config = config.config.get("linear_prob", {})
-        self.linear_prob_group_index = self.linear_prob_config.get("group_idx", -1)
-        print(f"linear prob config is {self.linear_prob_config}, group index is {self.linear_prob_group_index}")
 
         # Continual group index
         self.group_index = config["continual"]["group_idx"]
@@ -59,39 +55,27 @@ class ContinualTrainer:
         self.start_epoch = 1
         self.save_period = cfg_trainer['save_period']
 
-        # configuration to monitor model performance and save best
-        self.monitor = cfg_trainer.get('monitor', 'off')
-        if self.monitor == 'off':
-            self.mnt_mode = 'off'
-            self.mnt_best = 0
-        else:
-            self.mnt_mode, self.mnt_metric = self.monitor.split()
-            assert self.mnt_mode in ['min', 'max']
-
-            self.mnt_best = inf if self.mnt_mode == 'min' else -inf
-            self.early_stop = cfg_trainer.get('early_stop', inf)
-            if self.early_stop <= 0:
-                self.early_stop = inf
-
         # setup visualization writer instance
         self.writer = TensorboardWriter(config.log_dir, self.logger, cfg_trainer['tensorboard'])
 
-        self.org_len_epoch = len_epoch
+        self.iter_per_epoch = iter_per_epoch
 
         if config.resume is not None:
             self._resume_checkpoint(config.resume)
 
-
-
-        self.train_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns], writer=self.writer)
-        self.valid_metrics = MetricTracker('loss', *[m.__name__ for m in self.metric_ftns], writer=self.writer)
-        self.incremental_metrics = MetricTracker(*[m.__name__ for m in self.metric_ftns], writer=self.writer)
+        metrics = []
+        for m in self.metric_ftns:
+            if m.__name__ == "visualtext_retrieval_accuracy":
+                metrics += ["visual2text_retrieval_accuracy_top1", "visual2text_retrieval_accuracy_top5",
+                            "text2visual_retrieval_accuracy_top1", "text2visual_retrieval_accuracy_top5"]
+            else:
+                metrics.append(m.__name__)
+        self.incremental_metrics = MetricTracker(*metrics, writer=self.writer)
+        self.train_metrics = MetricTracker('loss', *metrics, writer=self.writer)
+        self.valid_metrics = MetricTracker('loss', *metrics, writer=self.writer)
 
     def next_task(self):
         updates, train_dataloader = self.train_dataset.next_task()
-        if self.config["arch"]["type"] == "MVF":
-            mean_var = self.train_dataset.compute_cls_mean_var(self.model, updates["selected_classes"])
-            updates.update(mean_var)
         if hasattr(self.model, "module"):
             self.model.module.next_task(updates)
         else:
@@ -102,15 +86,15 @@ class ContinualTrainer:
         self.data_loader = train_dataloader
         self.valid_data_loader = val_dataloader
         self.do_validation = self.valid_data_loader is not None
-        self.log_step = int(np.sqrt(self.data_loader.batch_size))
+        self.log_step = self.config["trainer"].get("log_step", int(np.sqrt(self.data_loader.batch_size)))
 
-        if self.org_len_epoch is None:
+        if self.iter_per_epoch is None:
             # epoch-based training
             self.len_epoch = len(train_dataloader)
         else:
             # iteration-based training
             self.data_loader = inf_loop(train_dataloader)
-            self.len_epoch = self.org_len_epoch
+            self.len_epoch = self.iter_per_epoch
 
         # Build group args
         args_group_index = self.group_index[self.current_task_id]
@@ -125,13 +109,13 @@ class ContinualTrainer:
     def build_decouple(self):
         decouple_train_dataset = copy.deepcopy(self.train_dataset)
         updates, decouple_train_loader = decouple_train_dataset.build_decouple()
-        if self.org_len_epoch is None:
+        if self.iter_per_epoch is None:
             # epoch-based training
             len_epoch = len(decouple_train_loader)
         else:
             # iteration-based training
             decouple_train_loader = inf_loop(decouple_train_loader)
-            len_epoch = self.org_len_epoch
+            len_epoch = self.iter_per_epoch
 
         self.decouple_epochs = self.trainer_group_args[self.decouple_group_index]["epochs"]
         # build optimizer, learning rate scheduler. delete every lines containing lr_scheduler for disabling scheduler
@@ -195,6 +179,21 @@ class ContinualTrainer:
         """
         Full training logic
         """
+        zero_shot_test = False
+        if zero_shot_test:
+            for task_id in range(self.start_task_id, self.task_num):
+                updates, train_dataloader = self.train_dataset.next_task()
+                updates, val_dataloader = self.val_dataset.next_task()
+                self.current_task_id += 1
+                self.data_loader = train_dataloader
+                self.valid_data_loader = val_dataloader
+            if self.local_rank == 0:
+                val_log = self._valid_epoch(self.epochs, self.valid_data_loader)
+                for k, v in val_log.items():
+                    self.logger.info(f"Validation zero shot. {k} : {v}")
+            return
+
+
         self.incremental_metrics.reset()
         for task_id in range(self.start_task_id, self.task_num):
             self.next_task()
@@ -210,32 +209,6 @@ class ContinualTrainer:
                 for key, value in log.items():
                     if self.local_rank == 0:
                         self.logger.info('    {:15s}: {}'.format(str(key), value))
-
-                # evaluate model performance according to configured metric, save best checkpoint as model_best
-                best = False
-                if self.mnt_mode != 'off':
-                    try:
-                        # check whether model performance improved or not, according to specified metric(mnt_metric)
-                        improved = (self.mnt_mode == 'min' and log[self.mnt_metric] <= self.mnt_best) or \
-                                   (self.mnt_mode == 'max' and log[self.mnt_metric] >= self.mnt_best)
-                    except KeyError:
-                        if self.local_rank == 0:
-                            self.logger.warning("Warning: Metric '{}' is not found. "
-                                            "Model performance monitoring is disabled.".format(self.mnt_metric))
-                        self.mnt_mode = 'off'
-                        improved = False
-
-                    if improved:
-                        self.mnt_best = log[self.mnt_metric]
-                        not_improved_count = 0
-                        best = True
-                    else:
-                        not_improved_count += 1
-
-                    if not_improved_count > self.early_stop and self.local_rank == 0:
-                        self.logger.info("Validation performance didn\'t improve for {} epochs. "
-                                     "Training stops.".format(self.early_stop))
-                        break
 
             if self.local_rank == 0:
                 self._save_checkpoint(task_id, self.epochs, save_best=False)
@@ -259,14 +232,14 @@ class ContinualTrainer:
                     self.model.module.after_decouple()
                 else:
                     self.model.after_decouple()
-            val_log = self._valid_epoch(self.epochs, self.valid_data_loader)
-            for k, v in val_log.items():
-                if k != "loss":
-                    self.incremental_metrics.update(k, v)
-                if self.local_rank == 0:
-                    for k, v in val_log.items():
-                        self.logger.info(f"Validation after task {task_id}. {k} : {v}")
+
             if self.local_rank == 0:
+                val_log = self._valid_epoch(self.epochs, self.valid_data_loader)
+                for k, v in val_log.items():
+                    if k != "loss":
+                        self.incremental_metrics.update({k: v})
+                for k, v in val_log.items():
+                    self.logger.info(f"Validation after task {task_id}. {k} : {v}")
                 self._save_checkpoint(task_id, self.epochs + self.decouple_epochs, save_best=False)
 
             # Build memory, build_memory() interfcce won't change the dataset itself
@@ -290,21 +263,42 @@ class ContinualTrainer:
         self.model.train()
         self.train_metrics.reset()
         for batch_idx, data in enumerate(train_loader):
-            #if batch_idx == 1:
-            #    print(f"break for debug")
-            #    break
+            if self.global_debug_flag and batch_idx == 1:
+               print(f"break for debug")
+               break
             if hasattr(self.model, "module"):
                 data = self.model.module.input_preprocess(data)
             else:
                 data = self.model.input_preprocess(data)
-            data = {k: v.to(self.device) for k, v in data.items()}
+
+
+            visual2text_idx_record = []
+            id2pos = {}
+            text2visual_idx_record = []
+
+            for i in range(len(data["text_idx"])):
+                text2visual_idx_record.append([data["text_idx"][i], data["visual_idx"][i]])
+                if data["visual_idx"][i] not in id2pos:
+                    id2pos[data["visual_idx"][i]] = len(visual2text_idx_record)
+                    visual2text_idx_record.append([data["visual_idx"][i], [data["text_idx"][i]]])
+                else:
+                    visual2text_idx_record[id2pos[data["visual_idx"][i]]][1].append(data["text_idx"][i])
+
+            if isinstance(data["text"], dict):
+                text_data = dict((k, data["text"][k].to(self.device)) for k in data["text"])
+                data = {"visual": data["visual"].to(self.device), "text": text_data}
+            else:
+                data = {"visual": data["visual"].to(self.device), "text": data["text"].to(self.device)}
 
             self.optimizer.zero_grad()
             output = self.model(data)
-            output.update(data)
-            output["is_train"] = True
-            output["is_decouple"] = is_decouple
-            loss = self.criterion(output)
+
+            metric_input = {"visual_feats": output["visual_embeddings"], "text_feats": output["text_embeddings"],
+                            "old_visual_feats": output["old_visual_embeddings"], "old_text_feats": output["old_text_embeddings"],
+                            "visual2text_record": visual2text_idx_record, "text2visual_record": text2visual_idx_record,
+                            "is_eval": False, "is_decouple": is_decouple}
+
+            loss = self.criterion(metric_input)
             if hasattr(self.model, "zero_shot"):
                if not self.model.zero_shot:
                    loss["loss_backward"].backward()
@@ -315,9 +309,9 @@ class ContinualTrainer:
             self.writer.set_step((epoch - 1) * len_epoch + batch_idx)
             for k, v in loss.items():
                 if k != "loss_backward":
-                    self.train_metrics.update(k, v)
+                    self.train_metrics.update({k: v})
             for met in self.metric_ftns:
-                self.train_metrics.update(met.__name__, met(output))
+                self.train_metrics.update(met(metric_input))
 
             if batch_idx % self.log_step == 0 and self.local_rank == 0:
                 log_str = 'Train Task {} Epoch: {} {}: '.format(self.current_task_id, epoch, self._progress(batch_idx, train_loader, len_epoch))
@@ -332,11 +326,10 @@ class ContinualTrainer:
                 break
         log = self.train_metrics.result()
 
-        if self.do_validation and self.val_step != -1 and (epoch % self.val_step == 0):
+        if self.do_validation and self.val_step != -1 and (epoch % self.val_step == 0) and self.local_rank == 0:
             val_log = self._valid_epoch(epoch, val_loader)
-            if self.local_rank == 0:
-                for k, v in val_log.items():
-                    self.logger.info(f"Validation at epoch {epoch}. {k} : {v}")
+            for k, v in val_log.items():
+                self.logger.info(f"Validation at epoch {epoch}. {k} : {v}")
             log.update(**{'val_'+k : v for k, v in val_log.items()})
 
         if self.lr_scheduler is not None:
@@ -350,59 +343,70 @@ class ContinualTrainer:
         :param epoch: Integer, current training epoch.
         :return: A log that contains information about validation
         """
-        self.model.eval()
+
         self.valid_metrics.reset()
-        task_acc = {}
-        task_cnt = {}
-        disp_cnt = 0
+
+        # Do validation only for GPU0 as the validation dataset is not distributed
+        if self.local_rank != 0:
+            return
+
+        self.model.eval()
+        visual_feats = []
+        text_feats = []
+        visual2text_idx_record = []
+        text2visual_idx_record = []
         with torch.no_grad():
+            val_loader.dataset.switch_flag("visual")
             for batch_idx, data in enumerate(val_loader):
-                #if batch_idx == 1:
-                #    print(f"break for debug in val")
-                #    break
+                if self.global_debug_flag and batch_idx == 1:
+                   print(f"break for debug in val")
+                   break
+
+                for i in range(len(data["visual_idx"])):
+                    l = data["text_idxs_length"][i]
+                    text_idxs = data["text_idxs"][i, :l].tolist()
+                    visual2text_idx_record.append([data["visual_idx"][i], text_idxs])
+
+                data = {"visual": data["visual"].to(self.device)}
+
+                output = self.model(data, visual_only=True)
+                visual_feats.append(output["visual_embeddings"])
+
+            val_loader.dataset.switch_flag("text")
+            for batch_idx, data in enumerate(val_loader):
+                if self.global_debug_flag and batch_idx == 1:
+                   print(f"break for debug in val")
+                   break
+
+                for i in range(len(data["text_idx"])):
+                    text2visual_idx_record.append([data["text_idx"][i], data["visual_idx"][i]])
+
                 if hasattr(self.model, "module"):
                     data = self.model.module.input_preprocess(data)
                 else:
                     data = self.model.input_preprocess(data)
 
-                data = {k: v.to(self.device) for k, v in data.items()}
+                if isinstance(data["text"], dict):
+                    text_data = dict((k, data["text"][k].to(self.device)) for k in data["text"])
+                    data = {"text": text_data}
+                else:
+                    data = {"text": data["text"].to(self.device)}
 
-                output = self.model(data)
-                output.update(data)
-                output["is_train"] = False
-                output["is_decouple"] = False
-                loss = self.criterion(output)
+                output = self.model(data, text_only=True)
+                text_feats.append(output["text_embeddings"])
 
-                if write_res:
-                    self.writer.set_step((epoch - 1) * len(val_loader) + batch_idx, 'valid')
-                for k, v in loss.items():
-                    if k != "loss_backward":
-                        self.valid_metrics.update(k, v)
+            visual_feats = torch.cat(visual_feats, dim=0)
+            text_feats = torch.cat(text_feats, dim=0)
+
+            metric_input = {"visual_feats": visual_feats, "text_feats": text_feats,
+                            "visual2text_record": visual2text_idx_record, "text2visual_record": text2visual_idx_record,
+                            "is_eval": True}
+            if self.global_debug_flag and batch_idx == 1:
+                print(f"bypass evaluation")
+            else:
                 for met in self.metric_ftns:
-                    met_res = met(output)
-                    if met.__name__ == "img_cls_accuracy":
-                        label = output["label"]
-                        task_index = output["task_index"]
-                        prompt = output["prompt_res"]
-                        pred = torch.argmax(prompt, dim=1)
-                        for i, t in enumerate(task_index):
-                            t = int(t)
-                            if t not in task_acc:
-                                task_acc[t] = 0
-                                task_cnt[t] = 0
-                            task_cnt[t] += 1
-                            if pred[i] == label[i]:
-                                task_acc[t] += 1
-                    self.valid_metrics.update(met.__name__, met_res)
+                    self.valid_metrics.update(met(metric_input))
 
-            if self.local_rank == 0:
-                for k in task_acc:
-                    print(f"Task {k} Accuracy is {task_acc[k] / task_cnt[k] * 100}")
-
-        # add histogram of model parameters to the tensorboard
-        for name, p in self.model.named_parameters():
-            if write_res:
-                self.writer.add_histogram(name, p, bins='auto')
         return self.valid_metrics.result()
 
     def _progress(self, batch_idx, data_loader, len_epoch):
@@ -431,7 +435,6 @@ class ContinualTrainer:
             'epoch': epoch,
             'state_dict': self.model.state_dict(),
             'optimizer': self.optimizer.state_dict(),
-            'monitor_best': self.mnt_best,
             'config': self.config
         }
         exper_name = self.config['name']
@@ -461,7 +464,6 @@ class ContinualTrainer:
         prev_task_id = self.start_task_id
         self.start_task_id = checkpoint['task_id'] + 1
         self.start_epoch = checkpoint['epoch'] + 1
-        self.mnt_best = checkpoint['monitor_best']
 
         #TODO: In continual learning model arch will change in different tasks, should first call next_task()
         # for several times and then load model and optimizer

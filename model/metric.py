@@ -1,9 +1,73 @@
+import numpy as np
 import torch
 import os
 from utils import sim_matrix
 
 global_video_embeddings = []
 global_text_embeddings = []
+
+
+def visualtext_retrieval_accuracy(data):
+    visual_feats = data["visual_feats"]
+    text_feats = data["text_feats"]
+    visual2text_idx_record = data["visual2text_record"]
+    text2visual_idx_record = data["text2visual_record"]
+    is_eval = data["is_eval"]
+
+    v2t_list = []
+    t2v_list = []
+    if is_eval:
+        visual_embeddings_all = visual_feats
+        text_embeddings_all = text_feats
+        for d in visual2text_idx_record:
+            v2t_list.append(d[1])
+        for d in text2visual_idx_record:
+            t2v_list.append(int(d[1]))
+    else:
+        # Do not sync across different GPUs, but this is just training acc, should be fine.
+        visual_embeddings_all = visual_feats
+        text_embeddings_all = text_feats
+        for d in visual2text_idx_record:
+            tmp = []
+            for txt_id in d[1]:
+                for i in range(len(text2visual_idx_record)):
+                    if txt_id == int(text2visual_idx_record[i][0]):
+                        tmp.append(i)
+                        break
+            v2t_list.append(tmp)
+        for d in text2visual_idx_record:
+            for i in range(len(visual2text_idx_record)):
+                if int(d[1]) == int(visual2text_idx_record[i][0]):
+                    t2v_list.append(i)
+                    break
+
+
+    visual2text = sim_matrix(visual_embeddings_all, text_embeddings_all).detach().cpu().numpy()
+    positive_text_rank = np.zeros(visual2text.shape[0])
+    for i, score in enumerate(visual2text):
+        inds = np.argsort(score)[::-1]
+        rank = inds.shape[0] + 1
+        for j in v2t_list[i]:
+            rk = np.where(inds == j)[0][0]
+            rank = min(rank, rk)
+        positive_text_rank[i] = rank
+    v2t_top1_acc = 100.0 * len(np.where(positive_text_rank < 1)[0]) / len(positive_text_rank)
+    v2t_top5_acc = 100.0 * len(np.where(positive_text_rank < 5)[0]) / len(positive_text_rank)
+
+    text2visual = sim_matrix(text_embeddings_all, visual_embeddings_all).detach().cpu().numpy()
+    positive_visual_rank = np.zeros(text2visual.shape[0])
+    for i, score in enumerate(text2visual):
+        inds = np.argsort(score)[::-1]
+        j = t2v_list[i]
+        rank = np.where(inds == j)[0][0]
+        positive_visual_rank[i] = rank
+    t2v_top1_acc = 100.0 * len(np.where(positive_visual_rank < 1)[0]) / len(positive_visual_rank)
+    t2v_top5_acc = 100.0 * len(np.where(positive_visual_rank < 5)[0]) / len(positive_visual_rank)
+
+    return {"visual2text_retrieval_accuracy_top1": v2t_top1_acc,
+            "visual2text_retrieval_accuracy_top5": v2t_top5_acc,
+            "text2visual_retrieval_accuracy_top1": t2v_top1_acc,
+            "text2visual_retrieval_accuracy_top5": t2v_top5_acc}
 
 def img_cls_accuracy(output):
     label = output["label"]

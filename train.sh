@@ -1,4 +1,4 @@
-export PYTHONPATH="${PYTHONPATH}:/mnt/code/POP/"
+export PYTHONPATH="${PYTHONPATH}:/mnt/code/CVTR/"
 
 
 set -e

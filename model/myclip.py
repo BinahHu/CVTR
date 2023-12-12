@@ -26,6 +26,7 @@ from functools import lru_cache
 import ftfy
 import regex as re
 
+import copy
 
 @lru_cache()
 def default_bpe():
@@ -581,6 +582,8 @@ class Transformer(nn.Module):
 class VisionTransformer(nn.Module):
     def __init__(self, input_resolution: int, patch_size: int, width: int, layers: int, heads: int, output_dim: int):
         super().__init__()
+        self.pretrained_prompt_num = 0
+        self.pretrained_prompt = None
         self.prompt_num = 0
         self.prompt_list = nn.ParameterList()
         self.width = width
@@ -606,6 +609,12 @@ class VisionTransformer(nn.Module):
     def pos_embed(self):
         return self.positional_embedding
 
+    def process_ckpt(self):
+        self.pretrained_prompt = copy.deepcopy(self.prompt_list[0])
+        self.pretrained_prompt.requires_grad = False
+        self.prompt_list = nn.ParameterList()
+        self.pretrained_prompt_num = self.pretrained_prompt.shape[0]
+
     def forward_with_prompts(self, x, prompts):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
@@ -630,39 +639,85 @@ class VisionTransformer(nn.Module):
 
         return x
 
-    def add_prompt(self, prompts_num=0, freeze_old_prompts=True):
+    def add_prompt(self, prompts_num=0, freeze_old_prompts=True, prompt_init="random", seq=False):
+        if seq and self.prompt_num > 0:
+            return
         if freeze_old_prompts:
             for p in self.prompt_list.parameters():
                 p.requires_grad = False
         if prompts_num > 0:
-            prompts = nn.Parameter(self.scale * torch.randn(prompts_num, self.width)).to(self.class_embedding.device)
+            if prompt_init == "cls_token":
+                prompts = nn.Parameter(0.1 * torch.randn(prompts_num, self.width)).to(
+                    self.class_embedding.device)
+                prompts += copy.deepcopy(self.class_embedding).detach()
+            elif prompt_init == "cls_token_2":
+                prompts = nn.Parameter(torch.randn(prompts_num, self.width)).to(
+                    self.class_embedding.device)
+                prompts += copy.deepcopy(self.class_embedding).detach()
+            elif prompt_init == "seq_init":
+                if len(self.prompt_list) == 0:
+                    prompts = nn.Parameter(0.1 * torch.randn(prompts_num, self.width)).to(
+                        self.class_embedding.device)
+                    prompts += copy.deepcopy(self.class_embedding).detach()
+                else:
+                    prompts = nn.Parameter(torch.zeros(prompts_num, self.width)).to(
+                        self.class_embedding.device)
+                    prompts += copy.deepcopy(self.prompt_list[-1]).detach()
+            else:
+                prompts = nn.Parameter(self.scale * torch.randn(prompts_num, self.width)).to(self.class_embedding.device)
             self.prompt_list.append(prompts)
             self.prompt_num += prompts_num
 
-    def forward(self, x: torch.Tensor):
+    def forward(self, x: torch.Tensor, forward_each_task=False):
         x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
         x = torch.cat([self.class_embedding.to(x.dtype) + torch.zeros(x.shape[0], 1, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)  # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
-        if self.prompt_num > 0:
-            prompt = torch.cat(list(self.prompt_list))
-            x = torch.cat([prompt.to(x.dtype) + torch.zeros(x.shape[0], self.prompt_num, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
-        x = self.ln_pre(x)
+        if self.pretrained_prompt_num > 0:
+            x = torch.cat([self.pretrained_prompt.to(x.dtype) + torch.zeros(x.shape[0], self.pretrained_prompt_num,
+                                                                            x.shape[-1], dtype=x.dtype,
+                                                                            device=x.device), x], dim=1)
+        if forward_each_task:
+            res = []
+            for prompt in self.prompt_list:
+                x_t = torch.cat([prompt.to(x.dtype) +
+                                 torch.zeros(x.shape[0], prompt.shape[1], x.shape[-1], dtype=x.dtype, device=x.device),
+                                 x], dim=1)
+                x_t = self.ln_pre(x_t)
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
+                x_t = x_t.permute(1, 0, 2)  # NLD -> LND
+                x_t = self.transformer(x_t)
+                x_t = x_t.permute(1, 0, 2)  # LND -> NLD
+                x_t = self.ln_post(x_t[:, self.pretrained_prompt_num, :])
 
-        if self.prompt_num > 0:
-            x = self.ln_post(x[:, :self.prompt_num + 1, :])
+                if self.proj is not None:
+                    x_t = x_t @ self.proj
+                res.append(x_t)
+            return res
+
         else:
-            x = self.ln_post(x[:, 0, :])
+            if self.prompt_num > 0:
+                prompt = torch.cat(list(self.prompt_list))
+                x = torch.cat([prompt.to(x.dtype) + torch.zeros(x.shape[0], self.prompt_num, x.shape[-1], dtype=x.dtype, device=x.device), x], dim=1)
+            x = self.ln_pre(x)
 
-        if self.proj is not None:
-            x = x @ self.proj
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = self.transformer(x)
+            x = x.permute(1, 0, 2)  # LND -> NLD
 
-        return x
+            if self.prompt_num > 0:
+                x = torch.cat((x[:, :self.prompt_num, :],
+                               x[:, self.prompt_num + self.pretrained_prompt_num: self.prompt_num + self.pretrained_prompt_num + 1, :]),
+                               dim=1)
+                x = self.ln_post(x)
+            else:
+                x = self.ln_post(x[:, self.pretrained_prompt_num, :])
+
+            if self.proj is not None:
+                x = x @ self.proj
+
+            return x
 
 
 class CLIP(nn.Module):
@@ -681,10 +736,12 @@ class CLIP(nn.Module):
                  transformer_layers: int
                  ):
         super().__init__()
+        self.pretrained_text_prompt_num = 0
+        self.pretrained_text_prompt = None
         self.text_prompt_num = 0
         self.text_prompt_list = nn.ParameterList()
         self.text_prompt_per_task = 0
-        self.text_prompt_full_attention = False
+        self.text_prompt_full_attention = True
         self.embed_dim = embed_dim
         self.transformer_width = transformer_width
 
@@ -727,13 +784,53 @@ class CLIP(nn.Module):
 
         self.initialize_parameters()
 
-    def add_prompt(self, vision_prompt_num=0, text_prompt_num=0, freeze_old_prompts=True):
+    def process_ckpt(self):
+        self.pretrained_text_prompt = copy.deepcopy(self.text_prompt_list[0])
+        self.pretrained_text_prompt.requires_grad = False
+        self.text_prompt_list = nn.ParameterList()
+        self.pretrained_text_prompt_num = self.pretrained_text_prompt.shape[0]
+        mask = self.build_attention_mask()
+        self.transformer.rebuild_mask(mask)
+
+        self.visual.process_ckpt()
+
+    def add_prompt(self, vision_prompt_num=0, text_prompt_num=0, freeze_old_prompts=True, prompt_init="random", seq=False):
+        if seq and self.text_prompt_num > 0:
+            return
+
         if freeze_old_prompts:
             for p in self.text_prompt_list.parameters():
                 p.requires_grad = False
 
         if text_prompt_num > 0:
-            text_prompt = nn.Parameter(torch.randn(text_prompt_num, self.transformer_width)).to(self.positional_embedding.device)
+            if prompt_init == "cls_token":
+                text_prompt = nn.Parameter(0.1 * torch.randn(text_prompt_num, self.transformer_width)).to(
+                    self.positional_embedding.device)
+                cls_token = self.token_embedding(torch.tensor([49407], dtype=torch.int32).to(self.positional_embedding.device)).type(self.dtype).detach()
+                text_prompt += cls_token
+            elif prompt_init == "cls_token_2":
+                text_prompt = nn.Parameter(torch.randn(text_prompt_num, self.transformer_width)).to(
+                    self.positional_embedding.device)
+                cls_token = self.token_embedding(torch.tensor([49407], dtype=torch.int32).to(self.positional_embedding.device)).type(self.dtype).detach()
+                text_prompt += cls_token
+            elif prompt_init == "text_scale":
+                scale = self.transformer_width ** -0.5
+                text_prompt = nn.Parameter(scale * torch.randn(text_prompt_num, self.transformer_width)).to(
+                    self.positional_embedding.device)
+            elif prompt_init == "seq_init":
+                if len(self.text_prompt_list) == 0:
+                    text_prompt = nn.Parameter(0.1 * torch.randn(text_prompt_num, self.transformer_width)).to(
+                        self.positional_embedding.device)
+                    cls_token = self.token_embedding(
+                        torch.tensor([49407], dtype=torch.int32).to(self.positional_embedding.device)).type(
+                        self.dtype).detach()
+                    text_prompt += cls_token
+                else:
+                    text_prompt = nn.Parameter(torch.zeros(text_prompt_num, self.transformer_width)).to(
+                        self.positional_embedding.device)
+                    text_prompt += copy.deepcopy(self.text_prompt_list[-1]).detach()
+            else:
+                text_prompt = nn.Parameter(torch.randn(text_prompt_num, self.transformer_width)).to(self.positional_embedding.device)
             if self.text_prompt_per_task != 0:
                 assert self.text_prompt_per_task == text_prompt_num
             else:
@@ -744,7 +841,7 @@ class CLIP(nn.Module):
             self.transformer.rebuild_mask(mask)
 
         assert hasattr(self.visual, "add_prompt")
-        self.visual.add_prompt(prompts_num=vision_prompt_num, freeze_old_prompts=freeze_old_prompts)
+        self.visual.add_prompt(prompts_num=vision_prompt_num, freeze_old_prompts=freeze_old_prompts, prompt_init=prompt_init)
 
     def initialize_parameters(self):
         nn.init.normal_(self.token_embedding.weight, std=0.02)
@@ -778,9 +875,13 @@ class CLIP(nn.Module):
     def build_attention_mask(self):
         # lazily create causal attention mask, with full attention between the vision tokens
         # pytorch uses additive attention mask; fill with -inf
-        mask = torch.empty(self.context_length+self.text_prompt_num, self.context_length+self.text_prompt_num)
+        mask = torch.empty(self.context_length+self.text_prompt_num+self.pretrained_text_prompt_num,
+                           self.context_length+self.text_prompt_num+self.pretrained_text_prompt_num)
         mask.fill_(float("-inf"))
         mask.triu_(1)  # zero out the lower diagonal
+        if self.pretrained_text_prompt_num > 0:
+            mask[self.text_prompt_num:self.text_prompt_num+self.pretrained_text_prompt_num, self.text_prompt_num:] = 1
+            mask[self.text_prompt_num:, self.text_prompt_num:self.text_prompt_num+self.pretrained_text_prompt_num] = 1
         if self.text_prompt_num > 0 and self.text_prompt_full_attention:
             task_num = self.text_prompt_num // self.text_prompt_per_task
             mask[:self.text_prompt_num, :] = 1
@@ -791,36 +892,58 @@ class CLIP(nn.Module):
     def dtype(self):
         return self.visual.conv1.weight.dtype
 
-    def encode_image(self, image):
-        return self.visual(image.type(self.dtype))
+    def encode_image(self, image, forward_each_task=False):
+        return self.visual(image.type(self.dtype), forward_each_task)
 
     def encode_image_with_prompts(self, image, prompts):
         return self.visual.forward_with_prompts(image.type(self.dtype), prompts)
 
-    def encode_text(self, text):
+    def encode_text(self, text, forward_each_task=False):
         x = self.token_embedding(text).type(self.dtype)  # [batch_size, n_ctx, d_model]
 
         x = x + self.positional_embedding.type(self.dtype)
-        if self.text_prompt_num > 0:
-            prompt = torch.cat(list(self.text_prompt_list))
-            x = torch.cat([prompt.to(x.dtype) + torch.zeros(x.shape[0], self.text_prompt_num, x.shape[-1], dtype=x.dtype,
-                                                            device=x.device), x], dim=1)
+        if self.pretrained_text_prompt_num > 0:
+            x = torch.cat(
+                [self.pretrained_text_prompt.to(x.dtype) + torch.zeros(x.shape[0], self.pretrained_text_prompt_num, x.shape[-1],
+                dtype=x.dtype, device=x.device), x], dim=1)
+        if forward_each_task:
+            res = []
+            for prompt in self.text_prompt_list:
+                x_t = torch.cat([prompt.to(x.dtype) +
+                                 torch.zeros(x.shape[0], prompt.shape[1], x.shape[-1],
+                                             dtype=x.dtype,device=x.device), x], dim=1)
+                x_t = x_t.permute(1, 0, 2)  # NLD -> LND
+                x_t = self.transformer(x_t)
+                x_t = x_t.permute(1, 0, 2)  # LND -> NLD
+                x_t = self.ln_final(x_t).type(self.dtype)
 
-        x = x.permute(1, 0, 2)  # NLD -> LND
-        x = self.transformer(x)
-        x = x.permute(1, 0, 2)  # LND -> NLD
-        x = self.ln_final(x).type(self.dtype)
+                x_t = x_t[torch.arange(x_t.shape[0]), self.pretrained_text_prompt_num + text.argmax(
+                    dim=-1)] @ self.text_projection
 
-        # x.shape = [batch_size, n_ctx, transformer.width]
-        # take features from the eot embedding (eot_token is the highest number in each sequence)
-        if self.text_prompt_num > 0:
-            eot = x[torch.arange(x.shape[0]), self.text_prompt_num + text.argmax(dim=-1)].unsqueeze(1)
-            prompt_output = x[:, :self.text_prompt_num, :]
-            x = torch.cat([prompt_output, eot], dim=1) @ self.text_projection
+                res.append(x_t)
+            return res
         else:
-            x = x[torch.arange(x.shape[0]), text.argmax(dim=-1)] @ self.text_projection
+            if self.text_prompt_num > 0:
+                prompt = torch.cat(list(self.text_prompt_list))
+                x = torch.cat([prompt.to(x.dtype) + torch.zeros(x.shape[0], self.text_prompt_num, x.shape[-1], dtype=x.dtype,
+                                                                device=x.device), x], dim=1)
 
-        return x
+            x = x.permute(1, 0, 2)  # NLD -> LND
+            x = self.transformer(x)
+            x = x.permute(1, 0, 2)  # LND -> NLD
+            x = self.ln_final(x).type(self.dtype)
+
+            # x.shape = [batch_size, n_ctx, transformer.width]
+            # take features from the eot embedding (eot_token is the highest number in each sequence)
+            if self.text_prompt_num > 0:
+                eot = x[torch.arange(x.shape[0]),
+                        self.text_prompt_num + self.pretrained_text_prompt_num + text.argmax(dim=-1)].unsqueeze(1)
+                prompt_output = x[:, :self.text_prompt_num, :]
+                x = torch.cat([prompt_output, eot], dim=1) @ self.text_projection
+            else:
+                x = x[torch.arange(x.shape[0]), self.pretrained_text_prompt_num + text.argmax(dim=-1)] @ self.text_projection
+
+            return x
 
     def forward(self, image, text):
         image_features = self.encode_image(image)
