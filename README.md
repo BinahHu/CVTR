@@ -35,3 +35,8 @@ Also, the previous experiments are all conducted in joint training setting, we n
 - [ ] Make adapter based method work
 - [ ] Check if prompt tuning is indeed not working
 - [ ] Run the experiments in continual learning setting
+
+
+## Contact
+
+Please contact me at binah67423693@gmail.com if you have any questions.
