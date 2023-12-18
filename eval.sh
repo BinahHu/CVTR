@@ -1,11 +1,8 @@
-export PYTHONPATH="${PYTHONPATH}:/mnt/code/CVTR/"
+export CUDA_VISIBLE_DEVICES=0
+LOG_NAME=CTP
+#LOG_NAME=CTP_ER
+OUT_DIR=/mnt2/save_1M_seq_finetune/${LOG_NAME}
 
-
-set -e
-HOST_NUM=1
-INDEX=0
-CHIEF_IP=localhost
-HOST_GPU_NUM=2
-
-#python3 -m torch.distributed.launch  --nnodes=$HOST_NUM  --node_rank=$INDEX  --master_addr $CHIEF_IP  --nproc_per_node $HOST_GPU_NUM  --master_port 8081  run/train_egoclip.py --config configs/pt/egoclip.json
-python3 -m torch.distributed.launch  --nnodes=$HOST_NUM  --master_addr $CHIEF_IP  --nproc_per_node $HOST_GPU_NUM  --master_port 8081 train.py --eval --config $1
+python eval.py \
+--output_dir ${OUT_DIR} \
+2>&1 | tee ./${LOG_NAME}.log

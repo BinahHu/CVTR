@@ -1,0 +1,100 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: cvtr-chineseclip-adpv2-512-12-convnorm-f4
+spec:
+  template:
+    spec:
+      volumes:
+      - name: dshm
+        emptyDir:
+          medium: Memory
+          sizeLimit: 8Gi
+      - name: log-central
+        persistentVolumeClaim:
+          claimName: log-central
+      - name: datasets-central
+        persistentVolumeClaim:
+          claimName: datasets-central
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: nvidia.com/gpu.product
+                operator: In
+                values:
+                - NVIDIA-GeForce-RTX-4090
+                - NVIDIA-RTX-A6000
+                - NVIDIA-TITAN-RTX
+                - NVIDIA-GeForce-RTX-3090
+                - NVIDIA-RTX-A4000
+                - NVIDIA-RTX-A5000
+                - NVIDIA-A10
+                - NVIDIA-A100-SXM4-80GB
+                - NVIDIA-A40
+              - key: nvidia.com/gpu.product
+                operator: NotIn
+                values:
+                - NVIDIA-A100-80GB-PCIe-MIG-1g.10gb
+                - NVIDIA-GeForce-RTX-2080-Ti	
+                - NVIDIA-TITAN-Xp
+                - Tesla-T4
+                - test
+              - key: kubernetes.io/hostname
+                operator: NotIn
+                values:
+                - ry-gpu-01.sdsc.optiputer.net
+                - ry-gpu-02.sdsc.optiputer.net
+                - ry-gpu-03.sdsc.optiputer.net
+                - ry-gpu-04.sdsc.optiputer.net
+                - ry-gpu-05.sdsc.optiputer.net
+                - ry-gpu-06.sdsc.optiputer.net
+                - ry-gpu-07.sdsc.optiputer.net
+                - ry-gpu-08.sdsc.optiputer.net
+                - ry-gpu-09.sdsc.optiputer.net
+                - ry-gpu-10.sdsc.optiputer.net
+                - ry-gpu-11.sdsc.optiputer.net
+                - ry-gpu-12.sdsc.optiputer.net
+                - ry-gpu-13.sdsc.optiputer.net
+                - ry-gpu-14.sdsc.optiputer.net
+                - ry-gpu-15.sdsc.optiputer.net
+                - ry-gpu-16.sdsc.optiputer.net
+                - k8s-4090-01.calit2.optiputer.net
+      containers:
+      - name: dne
+        image: zhiyuanhu1997/egovlp:1.5
+        volumeMounts:
+          - mountPath: /dev/shm
+            name: dshm
+          - mountPath: /mnt/log
+            name: log-central
+          - mountPath: /mnt/datasets
+            name: datasets-central
+        resources:
+           limits:
+             memory: 256Gi
+             cpu: 4
+             ephemeral-storage: 300Gi
+             nvidia.com/gpu: 8
+           requests:
+             memory: 256Gi
+             cpu: 4
+             ephemeral-storage: 300Gi
+             nvidia.com/gpu: 8
+        command: ["/bin/sh", "-c"]
+        args:
+          - >
+            git clone -b vim https://github.com/BinahHu/Myconfig.git &&
+            cp -r /mnt/log/code/CVTR /home/ &&
+            mv Myconfig/.vim ~/ &&
+            mv Myconfig/.vimrc ~/ &&
+            rm -rf Myconfig &&
+            cd /home/CVTR/shell &&
+            pip install transformers --upgrade &&
+            pip install ftfy regex tqdm ruamel.yaml fairscale  tensorboard_logger &&
+            pip install git+https://github.com/openai/CLIP.git &&
+            bash seq_JointT_convnorm.sh
+
+      restartPolicy: Never
+  backoffLimit: 4

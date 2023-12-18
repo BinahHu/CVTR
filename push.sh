@@ -1,1 +1,1 @@
-kubectl cp ../CVTR srip22-ctl/cvtr-dep-74df9f9f66-kdgfg:/mnt/code/
+kubectl cp ../CTP srip22-ctl/ctp-dep-75bc77fd67-hv9p7:/mnt/log/code/
